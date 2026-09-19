@@ -287,3 +287,79 @@ cluster는 다음 self-healing/readiness/liveness 실습에서 그대로 사용�
 ```powershell
 kind delete cluster --name kubernetes-ops-lab
 ```
+
+## Windows PowerShell 검증 (Slice 4: Pod 삭제와 Self-Healing)
+
+이번 slice는 실행 중인 Pod 하나를 직접 삭제하고, Deployment/ReplicaSet이 선언된 replica 수 `2`를 다시 만족시키기 위해 새 Pod를 생성하는 과정을 관찰한다. 삭제된 Pod 자체가 되살아나는 것이 아니라 **새 이름·새 UID·새 IP를 가진 replacement Pod**가 만들어지는 것이 핵심이다.
+
+### 삭제 전 상태와 대상 Pod 기록
+
+첫 PowerShell 창에서 Pod 변화를 계속 관찰한다.
+
+```powershell
+kubectl get pods -n kubernetes-ops-lab -w
+```
+
+두 번째 PowerShell 창에서 삭제할 Pod를 선택하고 identity를 기록한다.
+
+```powershell
+$victim = kubectl get pod -n kubernetes-ops-lab -l app.kubernetes.io/name=kubernetes-ops-lab -o jsonpath='{.items[0].metadata.name}'
+$victim
+
+kubectl get pod $victim -n kubernetes-ops-lab -o custom-columns='NAME:.metadata.name,UID:.metadata.uid,IP:.status.podIP,READY:.status.containerStatuses[0].ready'
+```
+
+### Pod 삭제와 replacement 관찰
+
+```powershell
+kubectl delete pod $victim -n kubernetes-ops-lab --wait=false
+```
+
+watch 창에서 가능한 범위까지 다음 흐름을 확인한다.
+
+- 기존 Pod가 `Terminating`으로 내려간다.
+- 새 Pod가 다른 이름으로 생성된다.
+- 새 Pod가 `Pending → ContainerCreating → Running → READY 1/1`로 변한다.
+- 중간 상태는 매우 짧아 일부가 보이지 않을 수 있다.
+
+복구 후 상태와 Service endpoint를 확인한다.
+
+```powershell
+kubectl get deployment,replicaset,pod -n kubernetes-ops-lab -o wide
+kubectl get endpointslice -n kubernetes-ops-lab -l kubernetes.io/service-name=kubernetes-ops-lab -o wide
+kubectl get events -n kubernetes-ops-lab --sort-by=.lastTimestamp
+```
+
+정상 기준:
+
+- Deployment가 다시 `READY 2/2`다.
+- ReplicaSet이 다시 `DESIRED/CURRENT/READY 2/2/2`다.
+- 삭제한 Pod 이름은 사라지고 새 Pod 이름이 존재한다.
+- replacement Pod의 UID와 IP는 삭제한 Pod와 다르다.
+- ReplicaSet Event에 replacement Pod에 대한 `SuccessfulCreate`가 남는다.
+- EndpointSlice가 다시 Ready Pod 두 개를 가리킨다.
+
+실제 관찰에서는 삭제된 Pod `...-6628g`의 IP `10.244.0.6` 대신 새 Pod `...-cvfvg`가 IP `10.244.0.7`로 생성됐고, ReplicaSet Event에도 새 Pod 생성이 기록됐다. 이 결과는 controller가 삭제된 Pod를 복원한 것이 아니라 **현재 상태가 desired replicas 2보다 부족해지자 새 Pod를 생성해 desired state를 다시 맞췄다**는 증거다.
+
+### Service 정상화 확인
+
+host port가 비어 있는지 확인한 뒤 port-forward를 실행한다.
+
+```powershell
+Get-NetTCPConnection -LocalPort 18080 -State Listen -ErrorAction SilentlyContinue
+kubectl port-forward -n kubernetes-ops-lab service/kubernetes-ops-lab 18080:80
+```
+
+다른 PowerShell 창에서:
+
+```powershell
+curl.exe -i http://localhost:18080/
+curl.exe -i http://localhost:18080/version
+```
+
+정상 기준:
+
+- `/` → HTTP 200, `kubernetes-ops-lab`
+- `/version` → HTTP 200, `v1`
+
+cluster는 다음 readiness/liveness 실습에서 계속 사용한다.
