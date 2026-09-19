@@ -363,3 +363,102 @@ curl.exe -i http://localhost:18080/version
 - `/version` → HTTP 200, `v1`
 
 cluster는 다음 readiness/liveness 실습에서 계속 사용한다.
+
+## Windows PowerShell 검증 (Slice 5: Readiness Failure)
+
+이번 slice는 한 Pod의 readiness만 의도적으로 실패시켜 **프로세스와 container는 계속 살아 있지만 Service 트래픽 대상에서는 제외되는 상태**를 확인한다. liveness failure와 달리 container restart가 일어나지 않는 것이 핵심이다.
+
+### 대상 Pod와 baseline 확인
+
+```powershell
+$target = kubectl get pod -n kubernetes-ops-lab -l app.kubernetes.io/name=kubernetes-ops-lab -o jsonpath='{.items[0].metadata.name}'
+$target
+kubectl get pod $target -n kubernetes-ops-lab -o custom-columns='NAME:.metadata.name,IP:.status.podIP,PHASE:.status.phase,READY:.status.containerStatuses[0].ready,RESTARTS:.status.containerStatuses[0].restartCount'
+```
+
+PowerShell 변수는 새 창에 자동으로 전달되지 않는다. 다른 PowerShell 창에서 `$target`을 사용할 때는 그 창에서도 다시 설정하거나 Pod 이름을 직접 사용한다.
+
+Pod 상태 변화를 별도 창에서 관찰한다.
+
+```powershell
+kubectl get pods -n kubernetes-ops-lab -w
+```
+
+대상 Pod에만 직접 요청하기 위해 다른 창에서 Pod port-forward를 실행한다.
+
+```powershell
+$target = kubectl get pod -n kubernetes-ops-lab -l app.kubernetes.io/name=kubernetes-ops-lab -o jsonpath='{.items[0].metadata.name}'
+kubectl port-forward -n kubernetes-ops-lab pod/$target 18081:8080
+```
+
+baseline은 `/health/live`와 `/health/ready`가 모두 HTTP 200이다.
+
+```powershell
+curl.exe -i http://localhost:18081/health/live
+curl.exe -i http://localhost:18081/health/ready
+```
+
+### Readiness failure 유발과 관찰
+
+```powershell
+curl.exe -i -X POST "http://localhost:18081/health/ready?ready=false"
+Start-Sleep -Seconds 5
+```
+
+대상 Pod와 Service endpoint를 확인한다.
+
+```powershell
+kubectl get pod $target -n kubernetes-ops-lab -o custom-columns='NAME:.metadata.name,PHASE:.status.phase,READY:.status.containerStatuses[0].ready,RESTARTS:.status.containerStatuses[0].restartCount'
+kubectl get endpointslice -n kubernetes-ops-lab -l kubernetes.io/service-name=kubernetes-ops-lab -o jsonpath='{range .items[*].endpoints[*]}{.addresses[0]}{" ready="}{.conditions.ready}{"`n"}{end}'
+
+curl.exe -i http://localhost:18081/
+curl.exe -i http://localhost:18081/health/live
+curl.exe -i http://localhost:18081/health/ready
+```
+
+정상적인 failure 상태:
+
+- 대상 Pod의 phase는 계속 `Running`이다.
+- 대상 Pod의 `READY`만 `false`가 된다.
+- `RestartCount`는 `0`으로 유지된다.
+- `/`와 `/health/live`는 HTTP 200으로 계속 응답한다.
+- `/health/ready`만 HTTP 503 `not-ready`를 반환한다.
+- EndpointSlice에서 대상 Pod만 `ready=false`가 되고 다른 replica는 `ready=true`를 유지한다.
+
+이 상태에서 Service를 port-forward하면 정상 replica가 계속 요청을 처리한다.
+
+```powershell
+kubectl port-forward -n kubernetes-ops-lab service/kubernetes-ops-lab 18080:80
+```
+
+다른 창에서:
+
+```powershell
+curl.exe -i http://localhost:18080/
+curl.exe -i http://localhost:18080/version
+```
+
+정상 기준은 HTTP 200 `kubernetes-ops-lab`, HTTP 200 `v1`이다.
+
+### Readiness 복구
+
+대상 Pod 직접 port-forward인 18081을 통해 readiness를 정상화한다.
+
+```powershell
+curl.exe -i -X POST "http://localhost:18081/health/ready?ready=true"
+Start-Sleep -Seconds 5
+
+kubectl get pod $target -n kubernetes-ops-lab -o custom-columns='NAME:.metadata.name,PHASE:.status.phase,READY:.status.containerStatuses[0].ready,RESTARTS:.status.containerStatuses[0].restartCount'
+kubectl get endpointslice -n kubernetes-ops-lab -l kubernetes.io/service-name=kubernetes-ops-lab -o jsonpath='{range .items[*].endpoints[*]}{.addresses[0]}{" ready="}{.conditions.ready}{"`n"}{end}'
+kubectl get events -n kubernetes-ops-lab --sort-by=.lastTimestamp
+```
+
+복구 기준:
+
+- 같은 Pod가 `Running`, `Ready=true`, `RestartCount=0`으로 돌아온다.
+- EndpointSlice에서 두 Pod 모두 다시 `ready=true`가 된다.
+- Event에 의도한 readiness probe HTTP 503 실패가 남는다.
+
+실제 관찰에서는 대상 Pod `...-cvfvg`의 IP `10.244.0.7`이 `ready=false`가 되었지만 container restart 없이 계속 Running 상태를 유지했고, 다른 Pod `10.244.0.5`는 `ready=true`를 유지해 Service가 계속 HTTP 200을 반환했다. 복구 후 동일한 대상 Pod가 restart 없이 다시 `ready=true`가 되었고 EndpointSlice에도 복귀했다.
+
+따라서 readiness failure는 **실행 중인 container를 재시작하는 신호가 아니라, 해당 Pod를 Service 트래픽 대상으로 사용할 준비가 되었는지를 나타내는 신호**임을 확인할 수 있다.
