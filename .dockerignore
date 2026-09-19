@@ -1,0 +1,28 @@
+# Version control and CI metadata
+.git
+.gitignore
+.github
+
+# Build output
+target
+**/target
+
+# IDE files
+.idea
+.vscode
+*.iml
+*.ipr
+*.iws
+.settings
+.classpath
+.project
+
+# Documentation
+README.md
+docs
+
+# Environment and OS noise
+.env
+.env.*
+.DS_Store
+Thumbs.db
