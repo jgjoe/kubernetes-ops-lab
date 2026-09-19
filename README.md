@@ -165,3 +165,125 @@ curl.exe -s http://localhost:18081/version   # verification-v2
 docker rm -f kubernetes-ops-lab-slice2-ver
 docker ps -a --filter "name=kubernetes-ops-lab-slice2"   # 출력이 없어야 한다
 ```
+
+## Windows PowerShell 검증 (Slice 3: kind 최초 배포)
+
+이번 slice는 새 kind cluster에 `v1` 이미지를 올리고 `Namespace → ConfigMap → Deployment → ReplicaSet → Pods → Service` 관계가 실제로 만들어지는지 확인한다. Probe failure와 Pod 삭제 같은 장애 실험은 아직 수행하지 않는다.
+
+전제:
+
+- Docker Desktop이 실행 중이다.
+- `kind`, `kubectl`이 설치되어 있다.
+- 로컬 Docker에 `kubernetes-ops-lab:v1` 이미지가 존재한다.
+- 현재 검증 환경(kind v0.33.0, 기본 node image Kubernetes v1.37.0)에서는 Docker가 cgroup v2를 사용해야 control-plane이 정상 기동했다. 먼저 다음 값이 `CgroupVersion=2`인지 확인한다.
+
+```powershell
+docker info --format 'CgroupVersion={{.CgroupVersion}} CgroupDriver={{.CgroupDriver}} Kernel={{.KernelVersion}}'
+```
+
+이 환경에서 `CgroupVersion=1`이면 `%USERPROFILE%\.wslconfig`의 기존 `[wsl2]` 섹션에 다음 kernel command line을 설정한 뒤 `wsl --shutdown`하고 Docker Desktop을 다시 시작해 cgroup v2로 전환했다.
+
+```ini
+[wsl2]
+kernelCommandLine=systemd.unified_cgroup_hierarchy=1 cgroup_no_v1=all
+```
+
+이미 `[wsl2]` 또는 `kernelCommandLine` 설정이 있다면 중복 섹션을 만들거나 기존 옵션을 덮어쓰지 말고 필요한 옵션을 합친다.
+
+### cluster 생성과 상태 확인
+
+```powershell
+kind create cluster --name kubernetes-ops-lab
+kubectl cluster-info --context kind-kubernetes-ops-lab
+kubectl get nodes
+```
+
+### 로컬 image를 kind node에 적재
+
+kind node는 호스트 Docker image를 자동으로 사용하지 않으므로 명시적으로 적재한다.
+
+```powershell
+kind load docker-image kubernetes-ops-lab:v1 --name kubernetes-ops-lab
+```
+
+### manifest 적용
+
+Namespace를 먼저 만든 뒤 namespaced resource를 적용한다.
+
+```powershell
+kubectl apply -f .\k8s\namespace.yaml
+kubectl apply -f .\k8s\configmap.yaml
+kubectl apply -f .\k8s\deployment.yaml
+kubectl apply -f .\k8s\service.yaml
+
+kubectl rollout status deployment/kubernetes-ops-lab -n kubernetes-ops-lab --timeout=120s
+```
+
+### Deployment → ReplicaSet → Pods → Service 관찰
+
+```powershell
+kubectl get deployment,replicaset,pod,service -n kubernetes-ops-lab -o wide
+kubectl get endpointslice -n kubernetes-ops-lab -l kubernetes.io/service-name=kubernetes-ops-lab -o wide
+```
+
+확인할 것:
+
+- Deployment의 desired/ready replica가 `2/2`다.
+- Deployment가 ReplicaSet을 만들었고 ReplicaSet이 두 Pod를 유지한다.
+- 두 Pod가 `Running`이면서 `READY 1/1`이다.
+- Service selector와 Pod label이 연결되고 EndpointSlice에 Ready Pod 주소가 들어간다.
+
+### Probe와 requests/limits가 실제 Pod spec에 적용됐는지 확인
+
+```powershell
+$pod = kubectl get pod -n kubernetes-ops-lab -l app.kubernetes.io/name=kubernetes-ops-lab -o jsonpath='{.items[0].metadata.name}'
+
+kubectl describe pod $pod -n kubernetes-ops-lab
+kubectl get pod $pod -n kubernetes-ops-lab -o jsonpath='{.spec.containers[0].resources}'
+Write-Host
+```
+
+`describe`에서 `/health/ready`, `/health/live` probe를 확인하고 resource 출력에서 다음 설정이 실제 Pod에 적용됐는지 확인한다.
+
+- requests: CPU `100m`, memory `128Mi`
+- limits: CPU `500m`, memory `256Mi`
+
+`requests`는 scheduler가 배치에 필요한 자원을 판단하는 기준이고, `limits`는 container가 사용할 수 있는 자원의 상한이다. 이번 프로젝트에서는 부하, throttling, OOM 실험으로 확장하지 않는다.
+
+### Service를 통한 실제 HTTP 확인
+
+먼저 host port 18080이 비어 있는지 확인한다. 출력이 있다면 해당 PID가 이전 실습 프로세스인지 확인한 뒤 정리하거나 다른 빈 host port를 사용한다. 포트 충돌 상태에서 실행하면 `kubectl port-forward`가 실패하고, 이후 `curl`이 Kubernetes가 아닌 기존 프로세스에 연결될 수 있다.
+
+```powershell
+Get-NetTCPConnection -LocalPort 18080 -State Listen -ErrorAction SilentlyContinue
+```
+
+첫 PowerShell 창에서 port-forward를 유지한다.
+
+```powershell
+kubectl port-forward -n kubernetes-ops-lab service/kubernetes-ops-lab 18080:80
+```
+
+두 번째 PowerShell 창에서 확인한다.
+
+```powershell
+curl.exe -i http://localhost:18080/
+curl.exe -i http://localhost:18080/version
+curl.exe -i http://localhost:18080/health/ready
+curl.exe -i http://localhost:18080/health/live
+```
+
+정상 기준:
+
+- `/` → HTTP 200, `kubernetes-ops-lab`
+- `/version` → HTTP 200, `v1`
+- `/health/ready` → HTTP 200, `ready`
+- `/health/live` → HTTP 200, `alive`
+
+애플리케이션 JVM이 8080에서 listen하기 전에 readiness probe가 먼저 실행되면 초기 Event에 일시적인 `connection refused`가 남을 수 있다. 이후 Pod가 `Ready=True`가 되고 `Restart Count=0`을 유지하면 baseline 실패가 아니다. readiness 실패 자체는 container restart를 유발하지 않는다.
+
+cluster는 다음 self-healing/readiness/liveness 실습에서 그대로 사용하므로 이 slice가 끝나도 삭제하지 않는다. 전체 실습 종료 또는 재현성 확인 시 다음 명령으로 삭제할 수 있다.
+
+```powershell
+kind delete cluster --name kubernetes-ops-lab
+```

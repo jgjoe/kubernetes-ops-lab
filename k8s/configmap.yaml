@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kubernetes-ops-lab-config
+  namespace: kubernetes-ops-lab
+data:
+  APP_VERSION: "v1"
