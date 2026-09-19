@@ -462,3 +462,94 @@ kubectl get events -n kubernetes-ops-lab --sort-by=.lastTimestamp
 실제 관찰에서는 대상 Pod `...-cvfvg`의 IP `10.244.0.7`이 `ready=false`가 되었지만 container restart 없이 계속 Running 상태를 유지했고, 다른 Pod `10.244.0.5`는 `ready=true`를 유지해 Service가 계속 HTTP 200을 반환했다. 복구 후 동일한 대상 Pod가 restart 없이 다시 `ready=true`가 되었고 EndpointSlice에도 복귀했다.
 
 따라서 readiness failure는 **실행 중인 container를 재시작하는 신호가 아니라, 해당 Pod를 Service 트래픽 대상으로 사용할 준비가 되었는지를 나타내는 신호**임을 확인할 수 있다.
+
+## Windows PowerShell 검증 (Slice 6: Liveness Failure)
+
+이번 slice는 한 Pod의 liveness를 의도적으로 실패시켜 kubelet이 **Pod를 새로 만들지 않고 같은 Pod 안의 container를 재시작**하는 과정을 확인한다. Readiness failure와 달리 `RestartCount`가 증가하고 container ID가 바뀌는 것이 핵심이다.
+
+### 대상 Pod와 baseline identity 기록
+
+대상 Pod를 하나 선택하고 이름, UID, IP, restart count, container ID를 기록한다.
+
+```powershell
+$target = kubectl get pod -n kubernetes-ops-lab -l app.kubernetes.io/name=kubernetes-ops-lab -o jsonpath='{.items[0].metadata.name}'
+$target
+
+kubectl get pod $target -n kubernetes-ops-lab -o custom-columns='NAME:.metadata.name,UID:.metadata.uid,IP:.status.podIP,READY:.status.containerStatuses[0].ready,RESTARTS:.status.containerStatuses[0].restartCount,CONTAINER:.status.containerStatuses[0].containerID'
+```
+
+다른 PowerShell 창에서 대상 Pod를 watch한다.
+
+```powershell
+kubectl get pod $target -n kubernetes-ops-lab -w
+```
+
+또 다른 창에서 대상 Pod에 직접 port-forward한다. 새 PowerShell에서는 `$target`을 다시 설정하거나 Pod 이름을 직접 사용한다.
+
+```powershell
+kubectl port-forward -n kubernetes-ops-lab pod/$target 18081:8080
+```
+
+baseline은 liveness와 readiness가 모두 HTTP 200이다.
+
+```powershell
+curl.exe -i http://localhost:18081/health/live
+curl.exe -i http://localhost:18081/health/ready
+```
+
+### Liveness failure 유발과 container restart 관찰
+
+```powershell
+curl.exe -i -X POST "http://localhost:18081/health/live?live=false"
+```
+
+의도한 failure 응답은 HTTP 503 `not-alive`다. 현재 probe 설정은 `periodSeconds=2`, `failureThreshold=3`이므로 kubelet이 연속 실패를 확인한 뒤 container를 재시작한다.
+
+```powershell
+Start-Sleep -Seconds 10
+
+kubectl get pod $target -n kubernetes-ops-lab -o custom-columns='NAME:.metadata.name,UID:.metadata.uid,IP:.status.podIP,READY:.status.containerStatuses[0].ready,RESTARTS:.status.containerStatuses[0].restartCount,CONTAINER:.status.containerStatuses[0].containerID'
+kubectl describe pod $target -n kubernetes-ops-lab
+kubectl get events -n kubernetes-ops-lab --sort-by=.lastTimestamp
+```
+
+정상 기준:
+
+- Pod 이름과 UID가 baseline과 동일하다.
+- Pod IP도 동일하게 유지되는 것을 확인할 수 있다.
+- `RestartCount`가 `0 → 1`로 증가한다.
+- container ID는 새로운 값으로 바뀐다.
+- `describe`의 `Last State`에 이전 container 종료 상태가 남는다.
+- Event에 liveness probe HTTP 503 실패와 `Container app failed liveness probe, will be restarted`가 기록된다.
+
+이 결과는 Pod가 교체된 것이 아니라 **kubelet이 같은 Pod 안에서 container만 재시작했다**는 증거다. Slice 4의 Pod 삭제 실험에서는 Pod 이름·UID·IP가 바뀐 replacement Pod가 만들어졌다는 점과 구분한다.
+
+### process-local 상태 초기화와 정상 복구 확인
+
+애플리케이션의 probe 상태는 process-local 메모리이므로 새 Java process가 시작되면 기본 healthy 상태로 초기화된다. container restart 과정에서 Pod port-forward가 끊겼다면 같은 Pod에 다시 실행한다.
+
+```powershell
+kubectl port-forward -n kubernetes-ops-lab pod/$target 18081:8080
+```
+
+복구 상태를 확인한다.
+
+```powershell
+curl.exe -i http://localhost:18081/health/live
+curl.exe -i http://localhost:18081/health/ready
+curl.exe -i http://localhost:18081/version
+
+kubectl get endpointslice -n kubernetes-ops-lab -l kubernetes.io/service-name=kubernetes-ops-lab -o jsonpath='{range .items[*].endpoints[*]}{.addresses[0]}{" ready="}{.conditions.ready}{"`n"}{end}'
+```
+
+복구 기준:
+
+- `/health/live` → HTTP 200 `alive`
+- `/health/ready` → HTTP 200 `ready`
+- `/version` → HTTP 200 `v1`
+- 대상 Pod가 다시 `Ready=true`가 된다.
+- EndpointSlice에서 두 Pod가 모두 `ready=true`다.
+
+실제 관찰에서는 대상 Pod `...-cvfvg`가 UID `74ec...`, IP `10.244.0.7`을 그대로 유지한 채 `RestartCount 0 → 1`로 증가했고 container ID가 `69d206... → 16efd1...`로 바뀌었다. Event에는 liveness HTTP 503 실패 뒤 kubelet의 restart 메시지가 기록됐다. 재시작 후 `/health/live`, `/health/ready`, `/version`이 각각 HTTP 200 `alive`, `ready`, `v1`로 정상화됐고 두 Service endpoint도 다시 `ready=true`였다.
+
+따라서 **readiness failure는 traffic eligibility를 바꾸지만 container restart를 일으키지 않고, liveness failure는 kubelet이 unhealthy container를 같은 Pod 안에서 재시작하게 만든다**는 차이를 실제 실행 결과로 확인할 수 있다.
