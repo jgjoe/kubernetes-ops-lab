@@ -553,3 +553,113 @@ kubectl get endpointslice -n kubernetes-ops-lab -l kubernetes.io/service-name=ku
 실제 관찰에서는 대상 Pod `...-cvfvg`가 UID `74ec...`, IP `10.244.0.7`을 그대로 유지한 채 `RestartCount 0 → 1`로 증가했고 container ID가 `69d206... → 16efd1...`로 바뀌었다. Event에는 liveness HTTP 503 실패 뒤 kubelet의 restart 메시지가 기록됐다. 재시작 후 `/health/live`, `/health/ready`, `/version`이 각각 HTTP 200 `alive`, `ready`, `v1`로 정상화됐고 두 Service endpoint도 다시 `ready=true`였다.
 
 따라서 **readiness failure는 traffic eligibility를 바꾸지만 container restart를 일으키지 않고, liveness failure는 kubelet이 unhealthy container를 같은 Pod 안에서 재시작하게 만든다**는 차이를 실제 실행 결과로 확인할 수 있다.
+
+## Windows PowerShell 검증 (Slice 7: Successful Rolling Update v1 → v2)
+
+이번 slice는 clean kind cluster에서 revision 1의 v1 baseline을 만든 뒤 v2 release manifest를 적용해 Deployment의 Rolling Update 동작을 관찰한다.
+
+release는 image tag와 versioned ConfigMap을 함께 바꾼다.
+
+```text
+v1 = kubernetes-ops-lab:v1 + kubernetes-ops-lab-config-v1
+v2 = kubernetes-ops-lab:v2 + kubernetes-ops-lab-config-v2
+```
+
+Deployment의 rollout 전략은 `maxUnavailable: 0`, `maxSurge: 1`이다. 따라서 기존 Ready replica를 먼저 잃지 않고 신규 Pod를 추가해 readiness를 확인한 뒤 old replica를 줄인다.
+
+### clean v1 baseline
+
+새 cluster에 v1을 배포하고 rollout history와 현재 상태를 확인한다.
+
+```powershell
+kubectl rollout status deployment/kubernetes-ops-lab -n kubernetes-ops-lab --timeout=60s
+kubectl rollout history deployment/kubernetes-ops-lab -n kubernetes-ops-lab
+kubectl get deployment,replicaset,pod -n kubernetes-ops-lab -o wide
+kubectl get configmap -n kubernetes-ops-lab
+```
+
+baseline 기준:
+
+- revision 1의 change cause는 `release v1`이다.
+- Deployment는 `2/2` Ready다.
+- v1 ReplicaSet은 desired/current/ready가 모두 2다.
+- 두 v1 Pod가 `1/1 Running`, restart 0이다.
+- `kubernetes-ops-lab-config-v1`이 존재한다.
+- Service `/version`은 HTTP 200 `v1`을 반환한다.
+
+### ReplicaSet과 Pod를 나눠서 watch
+
+현재 `kubectl`에서는 `-w`와 함께 `replicaset,pod`처럼 여러 resource type을 한 번에 지정할 수 없으므로 두 PowerShell 창으로 나눠 관찰한다.
+
+ReplicaSet watch:
+
+```powershell
+kubectl get replicaset -n kubernetes-ops-lab -w
+```
+
+Pod watch:
+
+```powershell
+kubectl get pod -n kubernetes-ops-lab -w
+```
+
+### v2 rollout
+
+```powershell
+kubectl apply -f k8s/configmap-v2.yaml
+kubectl apply -f k8s/deployment-v2.yaml
+
+kubectl rollout status deployment/kubernetes-ops-lab -n kubernetes-ops-lab --timeout=60s
+```
+
+실제 ReplicaSet watch에서는 다음 순서를 확인했다.
+
+```text
+v1 RS 94648b4bc: desired 2 / ready 2
+→ v2 RS 64cb45ffcc 생성
+→ v2 RS desired 1 / ready 1
+→ v1 RS desired 1
+→ v2 RS desired 2
+→ v2 RS ready 2
+→ v1 RS desired 0 / current 0 / ready 0
+```
+
+Pod watch에서는 첫 v2 Pod `...-8p82k`가 `Pending → ContainerCreating → Running → 1/1 Ready`가 된 뒤 기존 v1 Pod 하나가 종료됐고, 두 번째 v2 Pod `...-flgr9`가 `1/1 Ready`가 된 뒤 마지막 v1 Pod가 종료되는 순서를 확인했다.
+
+`kubectl rollout status`도 최종적으로 다음과 같이 성공했다.
+
+```text
+deployment "kubernetes-ops-lab" successfully rolled out
+```
+
+### rollout 완료 상태
+
+```powershell
+kubectl rollout history deployment/kubernetes-ops-lab -n kubernetes-ops-lab
+kubectl get deployment,replicaset,pod -n kubernetes-ops-lab -o wide
+kubectl get deployment kubernetes-ops-lab -n kubernetes-ops-lab -o jsonpath='image={.spec.template.spec.containers[0].image}{"`n"}config={.spec.template.spec.containers[0].env[0].valueFrom.configMapKeyRef.name}{"`n"}'
+```
+
+실제 최종 상태:
+
+- rollout history는 `1 = release v1`, `2 = release v2`다.
+- Deployment는 `2/2`, image는 `kubernetes-ops-lab:v2`다.
+- v2 ReplicaSet `64cb45ffcc`는 desired/current/ready `2/2/2`다.
+- v1 ReplicaSet `94648b4bc`는 `0/0/0`으로 축소됐다.
+- v2 Pod 두 개가 모두 `1/1 Running`, restart 0이다.
+- Deployment의 ConfigMap reference는 `kubernetes-ops-lab-config-v2`다.
+- v1과 v2 ConfigMap은 rollback을 위해 둘 다 유지된다.
+- EndpointSlice에는 v2 Pod IP `10.244.0.7`, `10.244.0.8`이 연결됐다.
+
+Service 최종 확인:
+
+```powershell
+curl.exe -i http://localhost:18080/version
+curl.exe -i http://localhost:18080/health/ready
+```
+
+실제 응답은 `/version`이 HTTP 200 `v2`, `/health/ready`가 HTTP 200 `ready`였다.
+
+따라서 Rolling Update는 **새 ReplicaSet과 신규 Ready Pod를 먼저 확보하고 old ReplicaSet을 점진적으로 축소해 desired state를 v2로 전환**한다는 것을 실제 상태 변화로 확인할 수 있다.
+
+참고로 rollout 전에 실행한 `/version` 반복 요청은 모두 `v1`로 끝났기 때문에 rollout 중 v1/v2 혼재 트래픽을 보여주는 evidence로 사용하지 않는다.
