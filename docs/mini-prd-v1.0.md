@@ -292,6 +292,13 @@ readiness가 실패하는 상태를 의도적으로 만든다.
 
 정상 v1을 v2로 업데이트한다.
 
+각 release는 동일 애플리케이션 소스를 release image tag와 versioned ConfigMap으로 묶어 표현한다.
+
+- v1: `kubernetes-ops-lab:v1` + `kubernetes-ops-lab-config-v1`
+- v2: `kubernetes-ops-lab:v2` + `kubernetes-ops-lab-config-v2`
+
+Deployment는 `maxUnavailable: 0`, `maxSurge: 1`, `progressDeadlineSeconds: 60`을 명시해 rollout 중 기존 Ready replica를 유지하면서 신규 Pod readiness를 관찰한다.
+
 다음을 관찰한다.
 
 - 새로운 ReplicaSet 생성
@@ -309,7 +316,9 @@ readiness가 실패하는 상태를 의도적으로 만든다.
 
 의도적으로 문제가 있는 v3를 배포한다.
 
-실패 원인은 기존 실습 기능을 이용한 단순하고 재현 가능한 형태로 제한한다.
+v3는 `kubernetes-ops-lab:v3` + `kubernetes-ops-lab-config-v3`를 사용하고, readiness probe path를 의도적으로 잘못 설정해 신규 Pod가 Ready가 되지 않는 상태를 재현한다.
+
+release별 ConfigMap은 rollback 실습이 끝날 때까지 유지한다. `kubectl rollout undo`는 이전 정상 Pod template의 image와 ConfigMap reference를 새 Deployment revision으로 복구하며, 과거 revision 번호 자체로 되돌아가는 동작으로 해석하지 않는다.
 
 다음 순서로 진단한다.
 

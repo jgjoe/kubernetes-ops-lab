@@ -4,7 +4,7 @@ metadata:
   name: kubernetes-ops-lab
   namespace: kubernetes-ops-lab
   annotations:
-    kubernetes.io/change-cause: "release v1"
+    kubernetes.io/change-cause: "release v3 with broken readiness probe"
 spec:
   replicas: 2
   progressDeadlineSeconds: 60
@@ -23,7 +23,7 @@ spec:
     spec:
       containers:
         - name: app
-          image: kubernetes-ops-lab:v1
+          image: kubernetes-ops-lab:v3
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
@@ -32,11 +32,11 @@ spec:
             - name: APP_VERSION
               valueFrom:
                 configMapKeyRef:
-                  name: kubernetes-ops-lab-config-v1
+                  name: kubernetes-ops-lab-config-v3
                   key: APP_VERSION
           readinessProbe:
             httpGet:
-              path: /health/ready
+              path: /health/ready-broken
               port: http
             initialDelaySeconds: 3
             periodSeconds: 2

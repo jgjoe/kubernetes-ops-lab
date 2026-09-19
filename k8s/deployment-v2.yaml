@@ -4,7 +4,7 @@ metadata:
   name: kubernetes-ops-lab
   namespace: kubernetes-ops-lab
   annotations:
-    kubernetes.io/change-cause: "release v1"
+    kubernetes.io/change-cause: "release v2"
 spec:
   replicas: 2
   progressDeadlineSeconds: 60
@@ -23,7 +23,7 @@ spec:
     spec:
       containers:
         - name: app
-          image: kubernetes-ops-lab:v1
+          image: kubernetes-ops-lab:v2
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
@@ -32,7 +32,7 @@ spec:
             - name: APP_VERSION
               valueFrom:
                 configMapKeyRef:
-                  name: kubernetes-ops-lab-config-v1
+                  name: kubernetes-ops-lab-config-v2
                   key: APP_VERSION
           readinessProbe:
             httpGet:
