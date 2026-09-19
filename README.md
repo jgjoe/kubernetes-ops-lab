@@ -72,16 +72,13 @@ v3에서는 readiness probe path를 의도적으로 잘못 설정해 실패 roll
 
 ## Verification
 
-2026-09-19 최종 로컬 검증 기준:
+2026-09-19 검증 기록:
 
 - Spring tests: **8/8 PASS**
 - kind control-plane: **Ready**
 - 최종 Deployment: **v2 / 2 of 2 Ready**
 - 최종 EndpointSlice: **Ready endpoints 2개**
-- application manifests: server-side dry-run 검증 완료
 - full runbook의 self-healing / readiness / liveness / rollout / rollback / scaling 시나리오 실행 완료
-
-기술 구현과 실행 검증은 완료됐습니다. README 없이 모든 개념을 설명하는 면접 숙련도는 별도 학습 과제로 남아 있습니다.
 
 ## Quick start — baseline deployment
 
@@ -121,8 +118,8 @@ curl.exe -i http://localhost:18080/health/live
 
 실제 실행 명령, 관찰 상태, Events, EndpointSlice, rollout history, 장애 유발·복구 절차는 다음 문서에 보존합니다.
 
-- [Runbook & Evidence](docs/runbook.md)
-- [Mini PRD v1.0 FINAL](docs/mini-prd-v1.0.md)
+- [Runbook & Evidence](docs/runbook.md) — 실제 명령·상태·Events·복구 기록
+- [Project scope / Mini PRD v1.0 FINAL](docs/mini-prd-v1.0.md) — 범위·설계 결정·non-goals
 
 runbook은 단순 명령 모음이 아니라 **명령 → 실제 출력/상태 → 해석 → 복구 → 정상화 확인** 순서로 기록했습니다.
 

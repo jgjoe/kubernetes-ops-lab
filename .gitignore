@@ -2,9 +2,9 @@
 .env.*
 !.env.example
 target/
-node_modules/
-__pycache__/
-.pytest_cache/
-dist/
 build/
+.idea/
+.vscode/
+*.iml
 .DS_Store
+Thumbs.db
