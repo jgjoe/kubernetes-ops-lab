@@ -663,3 +663,135 @@ curl.exe -i http://localhost:18080/health/ready
 따라서 Rolling Update는 **새 ReplicaSet과 신규 Ready Pod를 먼저 확보하고 old ReplicaSet을 점진적으로 축소해 desired state를 v2로 전환**한다는 것을 실제 상태 변화로 확인할 수 있다.
 
 참고로 rollout 전에 실행한 `/version` 반복 요청은 모두 `v1`로 끝났기 때문에 rollout 중 v1/v2 혼재 트래픽을 보여주는 evidence로 사용하지 않는다.
+
+## Windows PowerShell 검증 (Slice 8: Failed Rollout v3 → Diagnosis → Rollback)
+
+이번 slice는 정상 revision 2(v2) 상태에서 readiness probe path가 잘못된 v3 manifest를 배포해 rollout 실패를 재현하고, 원인을 진단한 뒤 마지막 정상 v2 Pod template으로 rollback한다.
+
+v3의 의도된 실패 조건은 다음과 같다.
+
+```text
+image: kubernetes-ops-lab:v3
+config: kubernetes-ops-lab-config-v3
+readiness probe: /health/ready-broken
+```
+
+### v3 failed rollout
+
+```powershell
+kubectl apply -f k8s/configmap-v3.yaml
+kubectl apply -f k8s/deployment-v3-bad.yaml
+
+kubectl rollout status deployment/kubernetes-ops-lab -n kubernetes-ops-lab --timeout=90s
+```
+
+실제 rollout은 다음 메시지로 실패했다.
+
+```text
+error: deployment "kubernetes-ops-lab" exceeded its progress deadline
+```
+
+실패 시점의 상태:
+
+- Deployment는 `READY 2/2`, `AVAILABLE 2`였지만 `UP-TO-DATE 1`이었다.
+- 기존 v2 ReplicaSet `64cb45ffcc`는 desired/current/ready `2/2/2`를 유지했다.
+- 신규 v3 ReplicaSet `7887f7776c`는 desired/current/ready `1/1/0`에서 멈췄다.
+- v3 Pod `...-4rqgx`는 container 상태가 `Running`, restart 0이지만 Pod readiness는 `0/1`이었다.
+- rollout history에는 revision 3이 `release v3 with broken readiness probe`로 추가됐다.
+- Deployment condition은 `Available=True`이면서 `Progressing=False`, reason은 `ProgressDeadlineExceeded`였다.
+
+이 상태는 **기존 정상 replica가 서비스 가용성을 유지하고 있어도 새 release rollout 자체는 실패할 수 있다**는 점을 보여준다.
+
+### get → describe/events → logs로 원인 진단
+
+v3 Pod를 찾고 상태를 확인한다.
+
+```powershell
+kubectl get pod -n kubernetes-ops-lab -o custom-columns='NAME:.metadata.name,READY:.status.containerStatuses[0].ready,RESTARTS:.status.containerStatuses[0].restartCount,IMAGE:.spec.containers[0].image,IP:.status.podIP'
+```
+
+실제 v3 Pod는 image `kubernetes-ops-lab:v3`, `READY=false`, restart 0이었다.
+
+```powershell
+kubectl describe pod $badPod -n kubernetes-ops-lab
+kubectl get events -n kubernetes-ops-lab --sort-by=.lastTimestamp
+kubectl logs $badPod -n kubernetes-ops-lab
+```
+
+`describe`와 Events에는 startup 직후 일시적인 connection refused 뒤, 잘못된 readiness 경로에 대한 HTTP 404가 반복 기록됐다.
+
+```text
+Readiness probe failed: HTTP probe failed with statuscode: 404
+```
+
+반면 application log에서는 Spring Boot와 Tomcat이 정상적으로 기동했다. 따라서 원인은 container crash나 liveness failure가 아니라 **Deployment manifest의 readiness probe path 오류**로 판단할 수 있다.
+
+실패 중 Service도 확인한다.
+
+```powershell
+curl.exe -i http://localhost:18080/version
+curl.exe -i http://localhost:18080/health/ready
+kubectl get endpointslice -n kubernetes-ops-lab -l kubernetes.io/service-name=kubernetes-ops-lab -o jsonpath='{range .items[*].endpoints[*]}{.addresses[0]}{" ready="}{.conditions.ready}{"`n"}{end}'
+```
+
+실제 Service 응답은 `/version` HTTP 200 `v2`, `/health/ready` HTTP 200 `ready`였다. EndpointSlice에는 기존 v2 Pod IP `10.244.0.7`, `10.244.0.8`이 `ready=true`, v3 Pod IP `10.244.0.9`가 `ready=false`로 나타났다.
+
+즉 readiness failure 때문에 v3 Pod는 Service의 정상 traffic 대상이 되지 않았고 기존 v2 replica가 계속 요청을 처리했다.
+
+### 마지막 정상 v2 revision으로 rollback
+
+실습에서는 이전 정상 revision 2를 확인한 뒤 명시적으로 rollback했다.
+
+```powershell
+kubectl rollout undo deployment/kubernetes-ops-lab -n kubernetes-ops-lab --to-revision=2
+kubectl rollout status deployment/kubernetes-ops-lab -n kubernetes-ops-lab --timeout=60s
+```
+
+`kubectl rollout undo`는 다음 경고를 출력했다.
+
+```text
+Rolling back will not update the kubectl.kubernetes.io/last-applied-configuration annotation
+```
+
+이는 `kubectl apply`로 관리하던 Deployment를 imperative rollback했기 때문에 last-applied annotation이 rollback 대상 manifest로 자동 동기화되지 않는다는 뜻이다. 이 실습에서는 rollback 동작 자체의 관찰 증거로 남기며, 이후 같은 Deployment에 다시 declarative apply를 할 때는 현재 manifest와 last-applied 상태를 확인한다.
+
+rollback status는 최종적으로 성공했다.
+
+```text
+deployment "kubernetes-ops-lab" successfully rolled out
+```
+
+### rollback 후 실제 상태
+
+```powershell
+kubectl rollout history deployment/kubernetes-ops-lab -n kubernetes-ops-lab
+kubectl get deployment,replicaset,pod -n kubernetes-ops-lab -o wide
+```
+
+실제 최종 상태:
+
+- Deployment는 다시 `2/2`, `UP-TO-DATE 2`, `AVAILABLE 2`가 됐다.
+- Deployment image는 `kubernetes-ops-lab:v2`다.
+- ConfigMap reference는 `kubernetes-ops-lab-config-v2`다.
+- Deployment revision은 `4`다.
+- v2 ReplicaSet `64cb45ffcc`는 `2/2/2`를 유지한다.
+- v3 ReplicaSet `7887f7776c`는 `0/0/0`으로 축소됐다.
+- v2 Pod 두 개는 계속 `1/1 Running`, restart 0이다.
+- Deployment condition은 `Available=True`, `Progressing=True`, reason `NewReplicaSetAvailable`로 복구됐다.
+- EndpointSlice에는 v2 Pod `10.244.0.7`, `10.244.0.8`만 `ready=true`로 남았다.
+- Service `/`, `/version`, `/health/ready`는 각각 HTTP 200 `kubernetes-ops-lab`, `v2`, `ready`를 반환했다.
+
+rollback 후 history는 다음처럼 관찰됐다.
+
+```text
+REVISION  CHANGE-CAUSE
+1         release v1
+3         rollback to release v2
+4         release v2
+```
+
+여기서 revision 2가 그대로 남지 않고 정상 v2 template이 revision 4로 올라간 것은 rollback이 revision 번호를 과거 값으로 되감는 동작이 아니라 **이전 ReplicaSet의 Pod template을 현재 Deployment의 새 revision으로 복구하는 동작**이기 때문이다.
+
+이번 실행에서는 rollback 직전에 현재 Deployment의 `kubernetes.io/change-cause`를 `rollback to release v2`로 덮어썼기 때문에 당시 current revision 3의 history 표시도 함께 바뀌었다. 따라서 재실행할 때는 실패 revision의 원래 change-cause를 보존하기 위해 rollback 직전 annotation overwrite를 생략하고 `kubectl rollout undo --to-revision=<last-healthy-revision>`만 수행한다.
+
+따라서 이 slice에서는 **잘못된 readiness 설정 → 신규 Pod NotReady → progress deadline 초과 → 기존 v2 Service 가용성 유지 → 원인 진단 → 정상 v2 template rollback → Ready/HTTP 복구**의 전체 운영 흐름을 재현했다.
