@@ -4,18 +4,18 @@ kind 환경에서 최소 Spring Boot 서비스를 사용해 Kubernetes의 배포
 
 구현 범위와 완료 기준의 정본은 [Kubernetes 운영 실습 — Mini PRD v1.0 FINAL](docs/mini-prd-v1.0.md)이다.
 
-## 현재 상태 (Slice 1: 애플리케이션)
+## Slice 1 구현: 애플리케이션
 
 - Java 17 + Spring Boot 3.5.16 + Maven Wrapper. 전역 Maven 설치 없이 `.\mvnw.cmd`로 build한다.
 - Kubernetes 동작 검증에 필요한 endpoint만 제공한다. 비즈니스 API와 Actuator는 없다.
 - readiness/liveness는 프로세스 메모리에만 저장한다. 프로세스가 시작하면 둘 다 `true`이고, 애플리케이션은 스스로 종료하거나 재시작하지 않는다.
 
-## 현재 상태 (Slice 2: 컨테이너 이미지)
+## Slice 2 구현: 컨테이너 이미지
 
 - 루트 `Dockerfile`은 Java 17 multi-stage build다. build stage는 전역 Maven 없이 저장소 Maven Wrapper로 `package`만 실행하고, runtime stage는 Java 17 JRE와 실행할 `app.jar`만 담는다.
 - 애플리케이션 port는 8080이며 이미지에 `HEALTHCHECK`는 없다. probe 의미는 Slice 1과 같다.
 - `.dockerignore`가 `target`, `.git`, IDE 파일, 문서를 build context에서 제외한다.
-- Kubernetes manifest, kind cluster, CI/CD는 아직 없다.
+- Slice 2에서는 container image까지만 다루고, Kubernetes manifest와 kind 배포는 Slice 3부터 이어진다. CI/CD는 이 프로젝트의 non-goal이다.
 
 ### Endpoints
 
@@ -343,10 +343,11 @@ kubectl get events -n kubernetes-ops-lab --sort-by=.lastTimestamp
 
 ### Service 정상화 확인
 
-host port가 비어 있는지 확인한 뒤 port-forward를 실행한다.
+Slice 3에서 실행한 Service port-forward(18080)가 아직 살아 있으면 그대로 재사용한다. 종료했다면 host port가 비어 있는지 확인한 뒤 별도 PowerShell 창에서 다시 실행한다. 이미 18080이 listen 중이면 중복으로 port-forward를 시작하지 않는다.
 
 ```powershell
 Get-NetTCPConnection -LocalPort 18080 -State Listen -ErrorAction SilentlyContinue
+# 위 명령에 출력이 없을 때만 별도 창에서 실행
 kubectl port-forward -n kubernetes-ops-lab service/kubernetes-ops-lab 18080:80
 ```
 
@@ -425,9 +426,11 @@ curl.exe -i http://localhost:18081/health/ready
 - `/health/ready`만 HTTP 503 `not-ready`를 반환한다.
 - EndpointSlice에서 대상 Pod만 `ready=false`가 되고 다른 replica는 `ready=true`를 유지한다.
 
-이 상태에서 Service를 port-forward하면 정상 replica가 계속 요청을 처리한다.
+이 상태에서 Service를 통해 정상 replica가 계속 요청을 처리하는지 확인한다. 기존 18080 Service port-forward가 살아 있으면 재사용하고, 종료했다면 별도 창에서 다시 실행한다.
 
 ```powershell
+Get-NetTCPConnection -LocalPort 18080 -State Listen -ErrorAction SilentlyContinue
+# 위 명령에 출력이 없을 때만 별도 창에서 실행
 kubectl port-forward -n kubernetes-ops-lab service/kubernetes-ops-lab 18080:80
 ```
 
@@ -463,6 +466,8 @@ kubectl get events -n kubernetes-ops-lab --sort-by=.lastTimestamp
 
 따라서 readiness failure는 **실행 중인 container를 재시작하는 신호가 아니라, 해당 Pod를 Service 트래픽 대상으로 사용할 준비가 되었는지를 나타내는 신호**임을 확인할 수 있다.
 
+Slice 6으로 넘어가기 전에 대상 Pod용 18081 port-forward 창은 `Ctrl+C`로 종료한다. Service용 18080 port-forward는 계속 재사용해도 된다.
+
 ## Windows PowerShell 검증 (Slice 6: Liveness Failure)
 
 이번 slice는 한 Pod의 liveness를 의도적으로 실패시켜 kubelet이 **Pod를 새로 만들지 않고 같은 Pod 안의 container를 재시작**하는 과정을 확인한다. Readiness failure와 달리 `RestartCount`가 증가하고 container ID가 바뀌는 것이 핵심이다.
@@ -481,6 +486,7 @@ kubectl get pod $target -n kubernetes-ops-lab -o custom-columns='NAME:.metadata.
 다른 PowerShell 창에서 대상 Pod를 watch한다.
 
 ```powershell
+$target = kubectl get pod -n kubernetes-ops-lab -l app.kubernetes.io/name=kubernetes-ops-lab -o jsonpath='{.items[0].metadata.name}'
 kubectl get pod $target -n kubernetes-ops-lab -w
 ```
 
@@ -554,6 +560,8 @@ kubectl get endpointslice -n kubernetes-ops-lab -l kubernetes.io/service-name=ku
 
 따라서 **readiness failure는 traffic eligibility를 바꾸지만 container restart를 일으키지 않고, liveness failure는 kubelet이 unhealthy container를 같은 Pod 안에서 재시작하게 만든다**는 차이를 실제 실행 결과로 확인할 수 있다.
 
+Slice 7에서는 kind cluster를 삭제하고 다시 만들기 때문에, Slice 6 종료 후 남아 있는 18081 Pod port-forward와 18080 Service port-forward 창은 모두 `Ctrl+C`로 종료한다.
+
 ## Windows PowerShell 검증 (Slice 7: Successful Rolling Update v1 → v2)
 
 이번 slice는 clean kind cluster에서 revision 1의 v1 baseline을 만든 뒤 v2 release manifest를 적용해 Deployment의 Rolling Update 동작을 관찰한다.
@@ -567,15 +575,65 @@ v2 = kubernetes-ops-lab:v2 + kubernetes-ops-lab-config-v2
 
 Deployment의 rollout 전략은 `maxUnavailable: 0`, `maxSurge: 1`이다. 따라서 기존 Ready replica를 먼저 잃지 않고 신규 Pod를 추가해 readiness를 확인한 뒤 old replica를 줄인다.
 
-### clean v1 baseline
+### v2/v3 image tag 준비와 clean cluster 재생성
 
-새 cluster에 v1을 배포하고 rollout history와 현재 상태를 확인한다.
+이 slice부터는 rollout history를 `revision 1 = v1`, `revision 2 = v2`, `revision 3 = failed v3` 순서로 깔끔하게 관찰하기 위해 앞선 실습 cluster를 삭제하고 새 kind cluster를 만든다. 앞선 Slice 3~6의 실제 evidence는 이미 README에 남아 있으므로 cluster를 재생성해도 된다.
+
+애플리케이션 코드는 바꾸지 않고 동일한 v1 image에 release tag만 추가한다.
 
 ```powershell
+docker tag kubernetes-ops-lab:v1 kubernetes-ops-lab:v2
+docker tag kubernetes-ops-lab:v1 kubernetes-ops-lab:v3
+docker images kubernetes-ops-lab
+```
+
+세 tag의 IMAGE ID가 같아도 정상이다. 이 lab에서 release 차이는 Deployment의 image tag 문자열과 versioned ConfigMap reference로 표현한다.
+
+기존 cluster를 지우고 새 cluster를 만든 뒤 Node가 Ready가 될 때까지 기다린다.
+
+```powershell
+kind delete cluster --name kubernetes-ops-lab
+kind create cluster --name kubernetes-ops-lab
+kubectl wait --for=condition=Ready nodes --all --timeout=120s
+```
+
+새 kind node에는 host Docker image가 없으므로 세 tag를 모두 다시 적재한다.
+
+```powershell
+kind load docker-image `
+  kubernetes-ops-lab:v1 `
+  kubernetes-ops-lab:v2 `
+  kubernetes-ops-lab:v3 `
+  --name kubernetes-ops-lab
+```
+
+### clean v1 baseline
+
+새 cluster에 v1 baseline을 다시 배포하고 rollout history와 현재 상태를 확인한다.
+
+```powershell
+kubectl apply -f k8s/namespace.yaml
+kubectl apply -f k8s/configmap.yaml
+kubectl apply -f k8s/deployment.yaml
+kubectl apply -f k8s/service.yaml
+
 kubectl rollout status deployment/kubernetes-ops-lab -n kubernetes-ops-lab --timeout=60s
 kubectl rollout history deployment/kubernetes-ops-lab -n kubernetes-ops-lab
 kubectl get deployment,replicaset,pod -n kubernetes-ops-lab -o wide
 kubectl get configmap -n kubernetes-ops-lab
+```
+
+Service HTTP 검증을 위해 별도 PowerShell 창에서 port-forward를 유지한다.
+
+```powershell
+kubectl port-forward -n kubernetes-ops-lab service/kubernetes-ops-lab 18080:80
+```
+
+다른 창에서 baseline 응답을 확인한다.
+
+```powershell
+curl.exe -i http://localhost:18080/
+curl.exe -i http://localhost:18080/version
 ```
 
 baseline 기준:
@@ -713,6 +771,9 @@ kubectl get pod -n kubernetes-ops-lab -o custom-columns='NAME:.metadata.name,REA
 실제 v3 Pod는 image `kubernetes-ops-lab:v3`, `READY=false`, restart 0이었다.
 
 ```powershell
+$badPod = kubectl get pod -n kubernetes-ops-lab -o jsonpath='{.items[?(@.spec.containers[0].image=="kubernetes-ops-lab:v3")].metadata.name}'
+$badPod
+
 kubectl describe pod $badPod -n kubernetes-ops-lab
 kubectl get events -n kubernetes-ops-lab --sort-by=.lastTimestamp
 kubectl logs $badPod -n kubernetes-ops-lab
@@ -781,7 +842,7 @@ kubectl get deployment,replicaset,pod -n kubernetes-ops-lab -o wide
 - EndpointSlice에는 v2 Pod `10.244.0.7`, `10.244.0.8`만 `ready=true`로 남았다.
 - Service `/`, `/version`, `/health/ready`는 각각 HTTP 200 `kubernetes-ops-lab`, `v2`, `ready`를 반환했다.
 
-rollback 후 history는 다음처럼 관찰됐다.
+첫 실제 실행에서는 rollback 직전에 current Deployment의 `kubernetes.io/change-cause`를 `rollback to release v2`로 덮어쓴 상태에서 undo를 수행했기 때문에 history가 다음처럼 관찰됐다.
 
 ```text
 REVISION  CHANGE-CAUSE
@@ -792,6 +853,71 @@ REVISION  CHANGE-CAUSE
 
 여기서 revision 2가 그대로 남지 않고 정상 v2 template이 revision 4로 올라간 것은 rollback이 revision 번호를 과거 값으로 되감는 동작이 아니라 **이전 ReplicaSet의 Pod template을 현재 Deployment의 새 revision으로 복구하는 동작**이기 때문이다.
 
-이번 실행에서는 rollback 직전에 현재 Deployment의 `kubernetes.io/change-cause`를 `rollback to release v2`로 덮어썼기 때문에 당시 current revision 3의 history 표시도 함께 바뀌었다. 따라서 재실행할 때는 실패 revision의 원래 change-cause를 보존하기 위해 rollback 직전 annotation overwrite를 생략하고 `kubectl rollout undo --to-revision=<last-healthy-revision>`만 수행한다.
+위 `revision 3 = rollback to release v2` 표시는 첫 실행에서 change-cause를 덮어쓴 데 따른 기록상의 부작용이다. 현재 README 재실행 절차에서는 이 annotation overwrite를 제거하고 `kubectl rollout undo --to-revision=2`만 수행한다. clean rerun에서는 실패 revision 3의 원래 `release v3 with broken readiness probe`를 보존하고, 복구된 v2 template이 새 revision 4로 올라가는 형태를 기대한다.
+
+```text
+REVISION  CHANGE-CAUSE
+1         release v1
+3         release v3 with broken readiness probe
+4         release v2
+```
 
 따라서 이 slice에서는 **잘못된 readiness 설정 → 신규 Pod NotReady → progress deadline 초과 → 기존 v2 Service 가용성 유지 → 원인 진단 → 정상 v2 template rollback → Ready/HTTP 복구**의 전체 운영 흐름을 재현했다.
+
+## Windows PowerShell 검증 (Slice 9: Resources 확인 + Manual Scaling 2 → 4 → 2)
+
+이번 slice는 application container의 CPU/memory requests와 limits가 실제 Pod spec에 적용됐는지 다시 확인하고, Deployment의 desired replicas를 `2 → 4 → 2`로 변경해 reconciliation을 관찰한다. 별도 CPU 부하, throttling 측정, memory stress, OOMKill 실험은 수행하지 않는다.
+
+### requests / limits 실제 적용 확인
+
+```powershell
+$pod = kubectl get pod -n kubernetes-ops-lab -l app.kubernetes.io/name=kubernetes-ops-lab -o jsonpath='{.items[0].metadata.name}'
+kubectl get pod $pod -n kubernetes-ops-lab -o jsonpath='{.spec.containers[0].resources}'
+```
+
+실제 Pod spec:
+
+```json
+{"limits":{"cpu":"500m","memory":"256Mi"},"requests":{"cpu":"100m","memory":"128Mi"}}
+```
+
+`requests`는 scheduler가 Pod 배치 시 필요한 자원량을 판단하는 기준이고, `limits`는 container가 사용할 수 있는 자원의 상한이다. CPU limit 초과는 일반적으로 throttling으로 나타날 수 있지만 memory limit 초과는 OOM 종료로 이어질 수 있으므로 두 resource limit의 runtime 동작은 동일하지 않다. 이번 프로젝트는 설정 적용과 의미 설명까지만 범위로 한다.
+
+### scale-out: 2 → 4
+
+```powershell
+kubectl scale deployment/kubernetes-ops-lab -n kubernetes-ops-lab --replicas=4
+kubectl wait --for=jsonpath='{.status.readyReplicas}'=4 deployment/kubernetes-ops-lab -n kubernetes-ops-lab --timeout=60s
+kubectl get deployment,replicaset,pod -n kubernetes-ops-lab -o wide
+```
+
+첫 실행에서는 scale 직후의 중간 상태도 관찰했다. Deployment는 `READY 2/4`, ReplicaSet은 desired/current `4/4`지만 ready는 2였고, 새 Pod 두 개는 `Running 0/1`이었다. EndpointSlice에서도 기존 두 endpoint만 `ready=true`, 새 두 endpoint는 `ready=false`였다. 이는 desired replica 수는 이미 4로 바뀌었지만 신규 Pod가 readiness를 통과하기 전인 reconciliation 중간 상태다.
+
+다시 2 → 4를 수행하고 `readyReplicas=4`를 기다린 뒤 다음 최종 scale-out 상태를 확인했다.
+
+- Deployment `READY 4/4`, `UP-TO-DATE 4`, `AVAILABLE 4`
+- v2 ReplicaSet `64cb45ffcc` desired/current/ready `4/4/4`
+- v2 Pod 네 개 모두 `1/1 Running`, restart 0
+- EndpointSlice의 `10.244.0.7`, `10.244.0.8`, `10.244.0.12`, `10.244.0.13` 네 endpoint 모두 `ready=true`
+- Service `/version`은 HTTP 200 `v2`
+- Service `/health/ready`는 HTTP 200 `ready`
+
+즉 scale-out에서는 기존 Pod를 교체한 것이 아니라 같은 v2 ReplicaSet이 desired state 4를 만족시키기 위해 새 Pod 두 개를 추가 생성했다.
+
+### scale-in: 4 → 2
+
+```powershell
+kubectl scale deployment/kubernetes-ops-lab -n kubernetes-ops-lab --replicas=2
+kubectl wait --for=jsonpath='{.status.readyReplicas}'=2 deployment/kubernetes-ops-lab -n kubernetes-ops-lab --timeout=60s
+kubectl get deployment,replicaset,pod -n kubernetes-ops-lab -o wide
+```
+
+최종 scale-in 상태:
+
+- Deployment `READY 2/2`, `UP-TO-DATE 2`, `AVAILABLE 2`
+- v2 ReplicaSet desired/current/ready `2/2/2`
+- v2 Pod 두 개 `1/1 Running`
+- EndpointSlice는 다시 `10.244.0.7`, `10.244.0.8` 두 endpoint만 `ready=true`
+- Service `/version`은 계속 HTTP 200 `v2`
+
+따라서 manual scaling은 **Deployment의 desired replicas를 변경하면 controller가 ReplicaSet/Pod의 actual state를 새 desired state에 맞추도록 생성·삭제를 수행하는 reconciliation**이라는 것을 실제 `2 → 4 → 2` 상태 변화로 확인했다.
