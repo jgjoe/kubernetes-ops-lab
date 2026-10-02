@@ -1,90 +1,86 @@
-# Kubernetes Operations Lab
+# Kubernetes Operations Lab — Kubernetes 운영 실습
 
-kind 기반 로컬 Kubernetes에서 최소 Spring Boot 서비스를 배포하고, 정상 상태뿐 아니라 장애·업데이트·복구 과정을 직접 재현한 운영 실습 프로젝트입니다.
+**kind 기반 로컬 Kubernetes에 Spring Boot 서비스를 배포하고 장애·업데이트·복구 과정을 직접 재현한 운영 실습**
 
-이 프로젝트의 목적은 많은 Kubernetes 도구를 나열하는 것이 아니라 **작은 시스템의 상태를 변경하고, 실제 Kubernetes 상태를 관찰하고, 원인을 진단하고, 정상 상태로 복구하는 흐름**을 검증하는 것입니다.
+작은 시스템의 상태를 바꾸고, 실제 Kubernetes 상태를 관찰하고, 원인을 진단하고, 정상 상태로 복구하는 흐름을 검증했습니다.
+명령, 실제 출력, 해석, 복구, 정상화 확인을 런북에 순서대로 남겼습니다.
 
-> **범위:** local kind lab입니다. production cluster 운영, managed Kubernetes(EKS/GKE/AKS), Helm, GitOps, HPA, Ingress, CI/CD를 수행한 프로젝트가 아닙니다.
+---
 
-## What I verified
+## 주요 기능
 
-- **Pod self-healing** — replicas=2 상태에서 Pod 하나를 삭제하고 ReplicaSet이 새 이름·UID·IP의 replacement Pod를 생성해 다시 desired state를 만족시키는 과정 확인
-- **Readiness failure** — Pod/container는 계속 실행되지만 Ready=false가 되고 Service EndpointSlice의 traffic 대상에서 제외되며 container restart는 발생하지 않는 것을 확인
-- **Liveness failure** — 같은 Pod 이름·UID·IP를 유지한 채 container ID가 바뀌고 RestartCount가 증가하는 container restart 확인
-- **Rolling Update** — v1 → v2에서 새 ReplicaSet과 Ready Pod가 먼저 만들어지고 기존 ReplicaSet이 점진적으로 축소되는 흐름 확인
-- **Failed rollout diagnosis** — 잘못된 v3 readiness path로 ProgressDeadlineExceeded를 재현하고 get, describe, Events, logs로 HTTP 404 probe 오류를 확인
-- **Rollback** — 마지막 정상 v2 Pod template으로 rollback한 뒤 Deployment 2/2, EndpointSlice, HTTP 응답 정상화 확인
-- **Manual scaling** — replicas 2 → 4 → 2 변경에 따라 ReplicaSet/Pod/Endpoint가 desired state에 맞춰 변하는 과정 확인
-- **Resource configuration** — 실제 Pod spec에서 requests 100m / 128Mi, limits 500m / 256Mi 적용 확인
+- **Pod 자가 복구** — replicas=2에서 Pod 하나를 지우면 ReplicaSet이 새 이름·UID·IP의 Pod를 만들어 원하는 상태를 되찾는 과정 확인
+- **readiness 실패** — 컨테이너는 계속 실행되지만 Ready=false가 되어 Service EndpointSlice 트래픽 대상에서 빠지고, 재시작은 일어나지 않음을 확인
+- **liveness 실패** — 같은 Pod 이름·UID·IP를 유지한 채 컨테이너 ID가 바뀌고 RestartCount가 늘어나는 재시작 확인
+- **Rolling Update** — v1 → v2에서 새 ReplicaSet과 Ready Pod가 먼저 뜬 뒤 기존 ReplicaSet이 점진적으로 줄어드는 흐름 확인
+- **실패한 배포 진단** — 잘못된 readiness 경로로 `ProgressDeadlineExceeded`를 재현하고 get·describe·Events·logs로 HTTP 404 probe 오류 확인
+- **롤백** — 마지막 정상 v2 템플릿으로 되돌린 뒤 Deployment 2/2, EndpointSlice, HTTP 응답 정상화 확인
+- **스케일링·리소스** — replicas 2 → 4 → 2 변경과 requests 100m/128Mi·limits 500m/256Mi 적용 확인
 
-## Representative failure scenario
+## 설계 판단
 
-~~~
-broken v3 readiness path
-→ new v3 Pod Running / NotReady
+### 실패를 의도적으로 만들어 원인을 구분했다
+
+```text
+잘못된 v3 readiness 경로
+→ 새 v3 Pod Running / NotReady
 → rollout ProgressDeadlineExceeded
-→ existing v2 replicas keep serving traffic
-→ describe / Events show readiness HTTP 404
-→ application logs show normal startup
-→ rollback to the last healthy v2 template
-→ Deployment 2/2 Ready + EndpointSlice + HTTP recovered
-~~~
+→ 기존 v2 replica가 계속 트래픽 처리
+→ describe / Events에서 readiness HTTP 404 확인
+→ 애플리케이션 로그는 정상 기동
+→ 마지막 정상 v2 템플릿으로 롤백
+→ Deployment 2/2 Ready + EndpointSlice + HTTP 정상화
+```
 
-이 실험에서는 신규 release가 실패해도 기존 Ready replica가 가용성을 유지할 수 있다는 점과, rollout 실패 원인을 container crash와 probe 설정 오류로 구분하는 과정을 확인했습니다.
+새 릴리스가 실패해도 기존 Ready replica가 가용성을 지키는 것을 확인했고, 배포 실패의 원인을 컨테이너 장애가 아니라 probe 설정 오류로 구분했습니다.
 
-## Architecture
+### 릴리스를 이미지 태그와 ConfigMap 버전으로 나눴다
 
-~~~
-Spring Boot 3.5 / Java 17
-        ↓ Docker image
-kind Kubernetes cluster
-        ↓
-Namespace
-ConfigMap
-Deployment (2 replicas)
-ReplicaSet
-Pods
-Service / EndpointSlice
-~~~
+같은 이미지에 태그와 버전별 ConfigMap을 달리 적용해 v1·v2·v3 릴리스를 만들고 롤아웃 동작을 관찰했습니다. v3에서는 readiness 경로를 의도적으로 잘못 설정해 실패한 배포를 만듭니다.
 
-애플리케이션은 실습에 필요한 endpoint만 제공합니다.
-
-| Method | Path | Purpose |
-| --- | --- | --- |
-| GET | / | 서비스 식별 |
-| GET | /version | release version 확인 |
-| GET / POST | /health/ready | readiness 상태 조회·전환 |
-| GET / POST | /health/live | liveness 상태 조회·전환 |
-
-probe 상태는 process-local memory에 저장되므로 container restart 후 healthy 기본값으로 초기화됩니다.
-
-## Release model used in the lab
-
-이 프로젝트의 v1/v2/v3는 서로 다른 애플리케이션 binary가 아닙니다. 같은 image bits에 서로 다른 image tag와 versioned ConfigMap을 적용해 Kubernetes rollout mechanics를 관찰했습니다.
-
-~~~
+```text
 v1 = kubernetes-ops-lab:v1 + kubernetes-ops-lab-config-v1
 v2 = kubernetes-ops-lab:v2 + kubernetes-ops-lab-config-v2
 v3 = kubernetes-ops-lab:v3 + kubernetes-ops-lab-config-v3
-~~~
+```
 
-v3에서는 readiness probe path를 의도적으로 잘못 설정해 실패 rollout을 만듭니다.
+### 상태를 바꿀 수 있는 최소 API
 
-## Verification
+애플리케이션은 실습에 필요한 엔드포인트만 제공합니다. probe 상태는 프로세스 메모리에 있어 컨테이너가 재시작되면 정상 기본값으로 돌아옵니다.
 
-2026-09-19 검증 기록:
+| Method | Path | 용도 |
+| --- | --- | --- |
+| GET | / | 서비스 식별 |
+| GET | /version | 릴리스 버전 확인 |
+| GET / POST | /health/ready | readiness 상태 조회·전환 |
+| GET / POST | /health/live | liveness 상태 조회·전환 |
 
-- Spring tests: **8/8 PASS**
-- kind control-plane: **Ready**
-- 최종 Deployment: **v2 / 2 of 2 Ready**
-- 최종 EndpointSlice: **Ready endpoints 2개**
-- full runbook의 self-healing / readiness / liveness / rollout / rollback / scaling 시나리오 실행 완료
+## 검증 결과
 
-## Quick start — baseline deployment
+2026-09-19 기준:
 
-전제: Windows PowerShell, Docker Desktop, Java 17, kubectl, kind.
+- Spring 테스트 **8/8 통과**
+- kind control-plane **Ready**
+- 최종 Deployment **v2 / 2 of 2 Ready**
+- 최종 EndpointSlice Ready endpoint **2개**
+- 자가 복구·readiness·liveness·롤아웃·롤백·스케일링 시나리오 전체 실행
 
-~~~powershell
+실제 명령·상태·Events·복구 기록은 [런북](docs/runbook.md)에, 범위와 설계 결정은 [Mini PRD](docs/mini-prd-v1.0.md)에 있습니다.
+
+## 기술 스택
+
+| 영역 | 기술 |
+|---|---|
+| 애플리케이션 | Spring Boot 3.5, Java 17 |
+| 컨테이너 | Docker |
+| 클러스터 | kind, kubectl |
+| Kubernetes 객체 | Namespace, ConfigMap, Deployment, ReplicaSet, Service, EndpointSlice |
+
+## 실행
+
+Windows PowerShell, Docker Desktop, Java 17, kubectl, kind가 필요합니다.
+
+```powershell
 .\mvnw.cmd test
 docker build -t kubernetes-ops-lab:v1 .
 
@@ -98,44 +94,18 @@ kubectl apply -f .\k8s\service.yaml
 
 kubectl rollout status deployment/kubernetes-ops-lab -n kubernetes-ops-lab --timeout=120s
 kubectl get deployment,replicaset,pod,service -n kubernetes-ops-lab -o wide
-kubectl get endpointslice -n kubernetes-ops-lab -l kubernetes.io/service-name=kubernetes-ops-lab -o wide
-~~~
+```
 
-Service 응답은 별도 PowerShell 창에서 port-forward 후 확인합니다.
+별도 창에서 port-forward 후 응답을 확인합니다.
 
-~~~powershell
+```powershell
 kubectl port-forward -n kubernetes-ops-lab service/kubernetes-ops-lab 18080:80
-~~~
-
-~~~powershell
-curl.exe -i http://localhost:18080/
 curl.exe -i http://localhost:18080/version
-curl.exe -i http://localhost:18080/health/ready
-curl.exe -i http://localhost:18080/health/live
-~~~
+```
 
-## Full runbook & evidence
+## 만든 사람
 
-실제 실행 명령, 관찰 상태, Events, EndpointSlice, rollout history, 장애 유발·복구 절차는 다음 문서에 보존합니다.
+**Jigwan Joe** — Backend · Ops
 
-- [Runbook & Evidence](docs/runbook.md) — 실제 명령·상태·Events·복구 기록
-- [Project scope / Mini PRD v1.0 FINAL](docs/mini-prd-v1.0.md) — 범위·설계 결정·non-goals
-
-runbook은 단순 명령 모음이 아니라 **명령 → 실제 출력/상태 → 해석 → 복구 → 정상화 확인** 순서로 기록했습니다.
-
-## Scope and limits
-
-의도적으로 다음 범위로 확장하지 않았습니다.
-
-- production Kubernetes 운영
-- managed Kubernetes / cloud cluster
-- Helm / GitOps / Argo CD
-- Prometheus / Grafana / Loki
-- Ingress / TLS
-- HPA / VPA
-- persistent database / storage failure
-- complex RBAC / NetworkPolicy
-- CI/CD
-- CPU throttling / OOM stress test
-
-이 저장소는 위 기술을 많이 붙이는 것보다 Kubernetes의 **reconciliation, traffic eligibility, container restart, rollout/rollback, diagnosis**를 실제 상태 변화로 이해하는 데 초점을 둡니다.
+- GitHub: [@jgjoe](https://github.com/jgjoe)
+- Email: jigwan.joe@gmail.com
